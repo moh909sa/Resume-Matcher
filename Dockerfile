@@ -165,8 +165,9 @@ USER appuser
 # Expose the public port (backend remains internal on 8000)
 EXPOSE 3000
 
-# Volume for persistent data
-VOLUME ["/app/backend/data"]
+# Persistent storage is configured at deployment time (e.g. Railway Volume
+# mounted at /app/backend/data), not via Dockerfile VOLUME.
+# On Railway set RAILWAY_RUN_UID=0 when attaching a root-owned volume.
 
 # Set working directory
 WORKDIR /app
