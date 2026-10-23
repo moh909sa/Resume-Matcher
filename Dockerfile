@@ -18,16 +18,14 @@ WORKDIR /app/frontend
 COPY apps/frontend/package*.json ./
 
 # Install dependencies (npm download cache kept between builds)
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci
+RUN npm ci
 
 # Copy frontend source
 COPY apps/frontend/ ./
 
 # Build the frontend (Next.js build cache kept between builds; it is not part of the
 # standalone output)
-RUN --mount=type=cache,target=/app/frontend/.next/cache \
-    npm run build
+RUN npm run build
 
 # ============================================
 # Stage 2: Final Image
@@ -66,9 +64,7 @@ RUN esc() { printf '%s' "$1" | sed 's/[&|\\]/\\&/g'; } \
 # Install system dependencies. BuildKit cache mounts keep the downloaded .debs between
 # builds (docker-clean would delete them after install), so a re-run of this layer
 # does not download everything again. The mounts are not part of the image.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    rm -f /etc/apt/apt.conf.d/docker-clean \
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
     && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -109,8 +105,7 @@ ARG PIP_INDEX_URL
 
 # Install the dependency list from pyproject.toml (read with tomllib so it never
 # drifts), without the package itself. The package is installed after the code copy.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" > /tmp/requirements.txt \
+RUN python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" > /tmp/requirements.txt \
     && pip install -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
@@ -137,8 +132,7 @@ COPY apps/backend/app /app/backend/app
 WORKDIR /app/backend
 
 # Install the backend package itself (dependencies are already installed above)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-deps .
+RUN pip install --no-deps .
 
 # ============================================
 # Frontend Setup
