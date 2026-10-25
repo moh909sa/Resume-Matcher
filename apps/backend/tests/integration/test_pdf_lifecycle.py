@@ -110,7 +110,15 @@ async def _render_or_skip() -> bytes:
         raise
 
 
-async def test_disconnected_cached_browser_is_replaced_automatically() -> None:
+@pytest.fixture
+def real_browser_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allow real process startup; deterministic deadline tests keep 2 seconds."""
+    monkeypatch.setattr(pdf_module, "_PDF_RENDER_TIMEOUT_SECONDS", 10.0)
+
+
+async def test_disconnected_cached_browser_is_replaced_automatically(
+    real_browser_budget: None,
+) -> None:
     """Closing the owned browser must not poison the next real render."""
     first = await _render_or_skip()
     disconnected = pdf_module._browser
@@ -129,6 +137,7 @@ async def test_disconnected_cached_browser_is_replaced_automatically() -> None:
 
 async def test_simultaneous_recovery_callers_install_one_browser(
     monkeypatch: pytest.MonkeyPatch,
+    real_browser_budget: None,
 ) -> None:
     """Concurrent callers share one replacement without overwriting ownership."""
     await _render_or_skip()

@@ -1039,15 +1039,8 @@ async def _claim_processing(
         raise
 
 
-@router.post("/upload", response_model=ResumeUploadResponse)
-async def upload_resume(
-    request: Request, file: UploadFile = File(...)
-) -> ResumeUploadResponse:
-    """Upload and process a resume file (PDF/DOCX).
-
-    Converts the file to Markdown and stores it in the database.
-    Optionally parses to structured JSON if LLM is configured.
-    """
+async def read_resume_upload(file: UploadFile) -> tuple[bytes, str]:
+    """Validate and extract once; callers may then retain the original bytes."""
     _validate_upload_type(file)
 
     content = await _read_upload_content(file)
@@ -1106,15 +1099,34 @@ async def upload_resume(
             ),
         )
 
-    # Store in database first with "processing" status (atomic master assignment)
-    # original_markdown is preserved permanently for date reference even after
-    # builder saves overwrite `content` with JSON.
     require_source_size(markdown_content)
+    return content, markdown_content
+
+
+@router.post("/upload", response_model=ResumeUploadResponse)
+async def upload_resume(
+    request: Request, file: UploadFile = File(...)
+) -> ResumeUploadResponse:
+    """Upload and process a standalone resume using the shared pipeline."""
+    _, markdown_content = await read_resume_upload(file)
+    return await store_resume_upload(request, markdown_content, file.filename)
+
+
+async def store_resume_upload(
+    request: Request,
+    markdown_content: str,
+    filename: str | None,
+    *,
+    resume_id: str | None = None,
+) -> ResumeUploadResponse:
+    """Run the existing processing/CAS pipeline inside the caller's owner scope."""
+    # Preserve the original Markdown for dates even after Builder JSON saves.
     try:
         resume = await db.create_resume_atomic_master(
+            **({"resume_id": resume_id} if resume_id is not None else {}),
             content=markdown_content,
             content_type="md",
-            filename=file.filename,
+            filename=filename,
             processed_data=None,
             processing_status="processing",
             original_markdown=markdown_content,
@@ -1155,7 +1167,7 @@ async def upload_resume(
         except (DatabaseBusyError, AIOperationDeadlineExceeded, PromptSizeError):
             raise
         except Exception as e:
-            logger.warning(f"Resume parsing to JSON failed for {file.filename}: {e}")
+            logger.warning(f"Resume parsing to JSON failed for {filename}: {e}")
             outcome = await db.finish_resume_processing(
                 resume["resume_id"],
                 processing_token,
@@ -1183,9 +1195,9 @@ async def upload_resume(
         # Return accurate status to client (API-001 fix)
         return ResumeUploadResponse(
             message=(
-                f"File {file.filename} uploaded successfully"
+                f"File {filename} uploaded successfully"
                 if resume["processing_status"] == "ready"
-                else f"File {file.filename} uploaded but parsing failed"
+                else f"File {filename} uploaded but parsing failed"
             ),
             request_id=str(uuid4()),
             resume_id=resume["resume_id"],

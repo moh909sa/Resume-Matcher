@@ -9,7 +9,7 @@ spin up fully isolated engines against a temp-file database or a scratch schema.
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Column, create_engine, event, inspect, text
+from sqlalchemy import Column, create_engine, event, inspect, select, text, update
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.schema import CreateColumn
@@ -123,6 +123,62 @@ def _init_postgres(engine: Engine, schema: str | None) -> None:
         _add_missing_column(conn, Improvement.__table__.c.ats_score, schema)
         _add_missing_column(conn, Improvement.__table__.c.forced_keywords, schema)
         _add_missing_column(conn, Resume.__table__.c.template_settings, schema)
+        _migrate_resume_owners(conn, schema)
+
+
+def _migrate_resume_owners(conn: Connection, schema: str | None = None) -> None:
+    """Preserve old rows in the NULL namespace and make defaults per owner."""
+    _add_missing_column(conn, Resume.__table__.c.owner_id, schema)
+    columns = {
+        column["name"] for column in inspect(conn).get_columns("resumes", schema=schema)
+    }
+    reflected = {
+        item["name"]: item
+        for item in inspect(conn).get_indexes("resumes", schema=schema)
+    }
+    indexes = {index.name: index for index in Resume.__table__.indexes}
+    indexes["ix_resumes_owner"].create(conn, checkfirst=True)
+    # Very old/minimal schemas are supported by the other additive migrations.
+    if not {"is_master", "is_default_master", "created_at"}.issubset(columns):
+        return
+    name = "ux_resumes_single_default_master"
+    old = reflected.get(name)
+    if old is not None and "owner_id" not in str(old.get("dialect_options", {})):
+        indexes[name].drop(conn)
+    for name in (
+        "ux_resumes_single_default_master",
+        "ux_resumes_owner_default_master",
+        "ix_resumes_owner",
+    ):
+        indexes[name].create(conn, checkfirst=True)
+    # Repair each namespace separately; never promote another user's master.
+    owners = (
+        conn.execute(
+            select(Resume.owner_id).where(Resume.is_master.is_(True)).distinct()
+        )
+        .scalars()
+        .all()
+    )
+    for owner in owners:
+        scope = Resume.owner_id.is_(None) if owner is None else Resume.owner_id == owner
+        current = conn.scalar(
+            select(Resume.resume_id)
+            .where(scope, Resume.is_default_master.is_(True))
+            .limit(1)
+        )
+        if current is None:
+            candidate = conn.scalar(
+                select(Resume.resume_id)
+                .where(scope, Resume.is_master.is_(True))
+                .order_by(Resume.created_at, Resume.resume_id)
+                .limit(1)
+            )
+            if candidate is not None:
+                conn.execute(
+                    update(Resume)
+                    .where(Resume.resume_id == candidate)
+                    .values(is_default_master=True)
+                )
 
 
 def init_models_sync(engine: Engine, schema: str | None = None) -> None:
@@ -150,21 +206,11 @@ def init_models_sync(engine: Engine, schema: str | None = None) -> None:
             # Multi-track masters: the single-master slot is replaced by a
             # single-default slot. create_all never drops indexes on existing tables.
             conn.exec_driver_sql("DROP INDEX IF EXISTS ux_resumes_single_master")
-            if "created_at" in existing_columns:
-                conn.exec_driver_sql(
-                    "UPDATE resumes SET is_default_master = 1 WHERE resume_id = ("
-                    "SELECT resume_id FROM resumes WHERE is_master = 1 "
-                    "ORDER BY created_at, resume_id LIMIT 1) "
-                    "AND NOT EXISTS (SELECT 1 FROM resumes WHERE is_default_master = 1)"
-                )
-            conn.exec_driver_sql(
-                "CREATE UNIQUE INDEX IF NOT EXISTS ux_resumes_single_default_master "
-                "ON resumes (is_default_master) WHERE is_default_master = 1"
-            )
 
         _add_missing_column(conn, Improvement.__table__.c.ats_score)
         _add_missing_column(conn, Improvement.__table__.c.forced_keywords)
         _add_missing_column(conn, Resume.__table__.c.template_settings)
+        _migrate_resume_owners(conn)
 
         preview_columns = (
             conn.exec_driver_sql("PRAGMA table_info(tailoring_previews)")
