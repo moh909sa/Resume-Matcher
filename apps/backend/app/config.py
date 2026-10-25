@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.db_url import normalize_database_url, validate_schema_name
@@ -334,6 +334,44 @@ class Settings(BaseSettings):
     reload: bool = False
     log_level: Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"] = "INFO"
     frontend_base_url: str = "http://localhost:3000"
+
+    # Opt-in mobile deployment: only authenticated /api/v1/mobile routes and
+    # liveness/docs remain public. Existing single-user APIs are then closed.
+    mobile_api_enabled: bool = False
+    supabase_url: str = ""
+    supabase_secret_key: SecretStr = SecretStr("")
+
+    @field_validator("supabase_url")
+    @classmethod
+    def normalize_supabase_url(cls, value: str) -> str:
+        """Accept a project root, never credentials, query strings or redirects."""
+        value = value.strip().rstrip("/")
+        if not value:
+            return value
+        parsed = urlsplit(value)
+        local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if (
+            (parsed.scheme != "https" and not (local and parsed.scheme == "http"))
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path
+        ):
+            raise ValueError("SUPABASE_URL must be the HTTPS project root")
+        return value
+
+    @field_validator("supabase_secret_key")
+    @classmethod
+    def validate_supabase_secret(cls, value: SecretStr) -> SecretStr:
+        """This server integration uses modern secret keys, not public keys."""
+        key = value.get_secret_value()
+        if key and (
+            not key.startswith("sb_secret_") or any(char.isspace() for char in key)
+        ):
+            raise ValueError("SUPABASE_SECRET_KEY must be a Supabase secret key")
+        return value
 
     # Total timeout for AI operations, including validation, database preloads,
     # model attempts and persistence. Nested stages share one deadline. It MUST be

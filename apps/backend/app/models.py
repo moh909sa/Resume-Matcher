@@ -43,6 +43,8 @@ class Resume(Base):
     __tablename__ = "resumes"
 
     resume_id: Mapped[str] = mapped_column(String, primary_key=True)
+    # NULL is the standalone legacy namespace; mobile scopes use verified Auth IDs.
+    owner_id: Mapped[str | None] = mapped_column(String, nullable=True)
     content: Mapped[str] = mapped_column(Text)
     content_type: Mapped[str] = mapped_column(String, default="md")
     filename: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -76,8 +78,16 @@ class Resume(Base):
             "ux_resumes_single_default_master",
             "is_default_master",
             unique=True,
-            sqlite_where=text("is_default_master = 1"),
-            postgresql_where=text("is_default_master"),
+            sqlite_where=text("is_default_master = 1 AND owner_id IS NULL"),
+            postgresql_where=text("is_default_master AND owner_id IS NULL"),
+        ),
+        Index("ix_resumes_owner", "owner_id"),
+        Index(
+            "ux_resumes_owner_default_master",
+            "owner_id",
+            unique=True,
+            sqlite_where=text("is_default_master = 1 AND owner_id IS NOT NULL"),
+            postgresql_where=text("is_default_master AND owner_id IS NOT NULL"),
         ),
     )
 

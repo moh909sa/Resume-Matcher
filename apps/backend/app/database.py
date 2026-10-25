@@ -51,6 +51,7 @@ from app.preview import (
     job_fingerprint,
     resume_fingerprint,
 )
+from app.resume_ownership import ResumeOwnerAsyncSession, current_resume_owner
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,8 @@ class Database:
         self._sync_engine = None
         self._sync_session_factory: sessionmaker[Session] | None = None
         self._initialized = False
+        self._mobile_async_engine = None
+        self._mobile_session_factory: async_sessionmaker[AsyncSession] | None = None
 
     # -- engine / session plumbing ------------------------------------------
 
@@ -183,15 +186,47 @@ class Database:
         init_models_sync(self._sync_engine, self.schema)
         self._async_engine = make_async_engine(self.db_path, **target)
         self._async_session_factory = async_sessionmaker(
-            self._async_engine, expire_on_commit=False
+            self._async_engine, class_=ResumeOwnerAsyncSession, expire_on_commit=False
         )
         self._initialized = True
 
     @property
     def _session(self) -> async_sessionmaker[AsyncSession]:
         self._ensure_initialized()
+        if current_resume_owner() is not None:
+            self._ensure_mobile_initialized()
+            assert self._mobile_session_factory is not None
+            return self._mobile_session_factory
         assert self._async_session_factory is not None
         return self._async_session_factory
+
+    def _ensure_mobile_initialized(self) -> None:
+        """Keep customer content out of the legacy single-user engine file.
+
+        An older build knows only resume_matcher.db. It must not accidentally
+        expose customer rows if an operator rolls back before the auth feature.
+        All owners share this second SQLite file and are isolated by ORM scope.
+        The existing synchronous encrypted provider-key store stays unchanged.
+        """
+        if self._mobile_session_factory is not None:
+            return
+        path = (
+            self.db_path.with_name(f"{self.db_path.stem}.mobile.db")
+            if self.db_path is not None
+            else settings.data_dir / "resume_matcher.mobile.db"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        engine = make_sync_engine(path)
+        try:
+            init_models_sync(engine)
+        finally:
+            engine.dispose()
+        self._mobile_async_engine = make_async_engine(path)
+        self._mobile_session_factory = async_sessionmaker(
+            self._mobile_async_engine,
+            class_=ResumeOwnerAsyncSession,
+            expire_on_commit=False,
+        )
 
     @property
     def backend(self) -> Literal["sqlite", "postgresql"]:
@@ -211,7 +246,10 @@ class Database:
         """
         with _translate_write_errors():
             async with self._session() as session:
-                for statement in self._write_lock():
+                for statement in _write_lock_statements(
+                    self.url is not None and current_resume_owner() is None,
+                    self.lock_timeout_ms,
+                ):
                     await session.execute(statement)
                 yield session
 
@@ -232,6 +270,10 @@ class Database:
 
     async def close(self) -> None:
         """Dispose engines and release file handles."""
+        if self._mobile_async_engine is not None:
+            await self._mobile_async_engine.dispose()
+            self._mobile_async_engine = None
+            self._mobile_session_factory = None
         if self._async_engine is not None:
             await self._async_engine.dispose()
             self._async_engine = None
@@ -377,10 +419,15 @@ class Database:
         return self._resume_to_dict(row)
 
     @staticmethod
-    def _new_resume(**values: Any) -> Resume:
+    def _new_resume(*, resume_id: str | None = None, **values: Any) -> Resume:
         """Construct a resume row for standalone or compound transactions."""
         now = _now()
-        return Resume(resume_id=str(uuid4()), created_at=now, updated_at=now, **values)
+        return Resume(
+            resume_id=resume_id or str(uuid4()),
+            created_at=now,
+            updated_at=now,
+            **values,
+        )
 
     async def create_resume_atomic_master(
         self,
@@ -396,6 +443,7 @@ class Database:
         interview_prep: str | None = None,
         template_settings: dict[str, Any] | None = None,
         *,
+        resume_id: str | None = None,
         take_over_stuck_default: bool = True,
         replay_if: Callable[[dict[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
@@ -444,6 +492,7 @@ class Database:
                 await session.flush()
                 is_default = True
             row = self._new_resume(
+                resume_id=resume_id,
                 content=content,
                 content_type=content_type,
                 filename=filename,

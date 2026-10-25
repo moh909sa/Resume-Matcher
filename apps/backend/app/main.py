@@ -21,6 +21,7 @@ from app.ai_budget import operation_error_content
 from app.config import settings
 from app.database import DatabaseBusyError, db
 from app.host_guard import HostGuardMiddleware
+from app.mobile_access import MobileApiGuardMiddleware
 from app.pdf import close_pdf_renderer
 from app.routers import (
     applications_router,
@@ -31,11 +32,13 @@ from app.routers import (
     enrichment_router,
     health_router,
     jobs_router,
+    mobile_router,
     resume_wizard_router,
     resumes_router,
     writing_router,
 )
 from app.routers.resumes import drain_processing_cleanup_tasks
+from app.services.supabase_backend import ResumeQuotaExceeded, SupabaseUnavailable
 
 
 def _configure_application_logging() -> None:
@@ -119,7 +122,34 @@ async def database_busy_handler(
     )
 
 
+@app.exception_handler(SupabaseUnavailable)
+async def supabase_unavailable_handler(
+    request: Request, error: SupabaseUnavailable
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content=operation_error_content(
+            request, "Service unavailable. Please retry shortly."
+        ),
+        headers={"Retry-After": "1"},
+    )
+
+
+@app.exception_handler(ResumeQuotaExceeded)
+async def resume_quota_handler(
+    request: Request, error: ResumeQuotaExceeded
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content=operation_error_content(
+            request,
+            "You can keep up to 5 original resumes. Delete one before uploading another.",
+        ),
+    )
+
+
 # CORS middleware - origins configurable via CORS_ORIGINS env var
+app.add_middleware(MobileApiGuardMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.effective_cors_origins,
@@ -132,6 +162,7 @@ app.add_middleware(HostGuardMiddleware, allowed_hosts=settings.effective_allowed
 
 # Include routers
 app.include_router(health_router, prefix="/api/v1")
+app.include_router(mobile_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
 app.include_router(resumes_router, prefix="/api/v1")
 app.include_router(jobs_router, prefix="/api/v1")
