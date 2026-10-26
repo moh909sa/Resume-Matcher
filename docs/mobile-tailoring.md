@@ -13,8 +13,9 @@ Base path: `/api/v1/mobile`. Do not call legacy `/api/v1/jobs` or
    * Intensity is forced to `full` **on the server**, not client-supplied.
    * Returns `tailoring_id`, `status=draft`, `preview` (resume_preview,
      detailed_changes, warnings, preview_expires_at), and `preferences`.
-   * Page fitting is best-effort. Show warnings when rendering unavailable or
-     the CV is longer than the requested page limit; never claim exact fit.
+   * Page fitting runs through a short-lived print draft and a loopback-only
+     internal API route. Show warnings if rendering fails or the CV exceeds the
+     requested limit; never promise an exact number of pages.
 4. Show the preview/diff for user review; DO NOT auto-confirm.
 5. On approval: POST `/tailor/{tailoring_id}/confirm` with no JSON body.
    The server confirms the exact stored draft and returns `status=ready` and

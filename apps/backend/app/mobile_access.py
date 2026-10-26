@@ -75,7 +75,19 @@ class MobileApiGuardMiddleware:
                 "/openapi.json",
                 "/docs/oauth2-redirect",
             } and scope["method"] in {"GET", "HEAD"}
-            if not public and not path.startswith("/api/v1/mobile/"):
+            # The Next.js print page fetches one-time drafts from the backend
+            # over container loopback. Permit only that narrow internal route,
+            # never a general bypass of mobile authorization or customer APIs.
+            draft_prefix = "/api/v1/resumes/render-drafts/"
+            peer = (scope.get("client") or ("", 0))[0]
+            draft_token = path[len(draft_prefix):] if path.startswith(draft_prefix) else ""
+            internal_page_fit = (
+                scope["method"] == "GET"
+                and peer in {"127.0.0.1", "::1"}
+                and len(draft_token) == 32
+                and all(c in "0123456789abcdef" for c in draft_token)
+            )
+            if not public and not internal_page_fit and not path.startswith("/api/v1/mobile/"):
                 await JSONResponse({"detail": "Not found"}, status_code=404)(
                     scope, receive, send
                 )
