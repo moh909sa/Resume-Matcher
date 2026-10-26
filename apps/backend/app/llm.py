@@ -787,6 +787,14 @@ def resolve_api_key(stored: dict, provider: str) -> str:
     endpoint) must call this function instead of reading ``stored["api_key"]``
     directly.
     """
+    # Mobile production credentials are managed through Railway. The encrypted
+    # legacy OpenRouter key must never shadow its replacement in LLM_API_KEY.
+    # Do not extend this override to local/custom providers (key leakage risk).
+    if provider == "openrouter" and settings.mobile_api_enabled:
+        environment_key = settings.llm_api_key.strip()
+        if environment_key:
+            return environment_key
+
     api_key = stored.get("api_key", "")
     if not api_key:
         api_keys = stored.get("api_keys", {})

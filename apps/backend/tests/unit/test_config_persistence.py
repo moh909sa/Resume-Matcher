@@ -17,6 +17,40 @@ from app.config_cache import invalidate_config_cache, load_config
 from app.routers.config import _get_config_path
 
 
+def test_railway_key_retires_only_encrypted_openrouter_key(
+    isolated_db: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import retire_stored_openrouter_key_for_mobile
+
+    isolated_db.set_api_key_ciphertext("openrouter", "old-encrypted-ciphertext")
+    isolated_db.set_api_key_ciphertext("openai", "other-encrypted-ciphertext")
+    monkeypatch.setattr(settings, "mobile_api_enabled", True)
+    monkeypatch.setattr(settings, "llm_api_key", "new-railway-key")
+
+    assert retire_stored_openrouter_key_for_mobile() is True
+    assert isolated_db.get_api_key_ciphertexts() == {
+        "openai": "other-encrypted-ciphertext"
+    }
+    assert retire_stored_openrouter_key_for_mobile() is False
+
+
+def test_no_railway_key_does_not_delete_encrypted_openrouter_key(
+    isolated_db: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import retire_stored_openrouter_key_for_mobile
+
+    isolated_db.set_api_key_ciphertext("openrouter", "old-encrypted-ciphertext")
+    monkeypatch.setattr(settings, "mobile_api_enabled", True)
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    assert retire_stored_openrouter_key_for_mobile() is False
+    assert "openrouter" in isolated_db.get_api_key_ciphertexts()
+
+    monkeypatch.setattr(settings, "mobile_api_enabled", False)
+    monkeypatch.setattr(settings, "llm_api_key", "new-railway-key")
+    assert retire_stored_openrouter_key_for_mobile() is False
+    assert "openrouter" in isolated_db.get_api_key_ciphertexts()
+
+
 def test_imported_config_path_is_owned_by_data_dir(
     imported_config_file_path: Path,
     backend_test_data_dir: Path,

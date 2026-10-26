@@ -190,6 +190,19 @@ class TestResolveApiKey:
         monkeypatch.setattr("app.llm.settings.llm_api_key", "sk-paid-secret")
         assert resolve_api_key({}, "openai_compatible") == ""
 
+    def test_mobile_openrouter_uses_railway_key_over_expired_stored_key(self, monkeypatch):
+        monkeypatch.setattr("app.llm.settings.mobile_api_enabled", True)
+        monkeypatch.setattr("app.llm.settings.llm_api_key", "sk-new-railway")
+        assert resolve_api_key(
+            {"api_key": "sk-old-top", "api_keys": {"openrouter": "sk-old-stored"}},
+            "openrouter",
+        ) == "sk-new-railway"
+
+    def test_non_mobile_openrouter_keeps_existing_provider_key(self, monkeypatch):
+        monkeypatch.setattr("app.llm.settings.mobile_api_enabled", False)
+        monkeypatch.setattr("app.llm.settings.llm_api_key", "sk-railway")
+        assert resolve_api_key({"api_keys": {"openrouter": "sk-local"}}, "openrouter") == "sk-local"
+
     def test_cloud_provider_does_inherit_env_key(self, monkeypatch):
         monkeypatch.setattr("app.llm.settings.llm_api_key", "sk-paid-secret")
         assert resolve_api_key({}, "openai") == "sk-paid-secret"

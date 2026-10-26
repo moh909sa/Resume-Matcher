@@ -68,9 +68,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("Startup data migration: %s", result)
     # Fold any legacy plaintext API keys into the encrypted store (idempotent,
     # non-clobbering), then strip them from config.json.
-    from app.config import migrate_legacy_keys
+    from app.config import migrate_legacy_keys, retire_stored_openrouter_key_for_mobile
 
     migrate_legacy_keys()
+    if retire_stored_openrouter_key_for_mobile():
+        logger.info("Retired stored OpenRouter key; Railway LLM_API_KEY is now authoritative.")
 
     from app.services.queue_worker import queue_manager
 

@@ -180,6 +180,24 @@ def delete_api_key_from_config(provider: str) -> None:
     db.delete_api_key(provider)
 
 
+def retire_stored_openrouter_key_for_mobile() -> bool:
+    """Remove the obsolete encrypted OpenRouter key when Railway supplies its replacement.
+
+    Only the authenticated mobile deployment is migrated. Other providers' keys,
+    saved configurations, user documents, and resume records stay untouched.
+    This operation is idempotent across Railway restarts.
+    """
+    if not settings.mobile_api_enabled or not settings.llm_api_key.strip():
+        return False
+
+    from app.database import db
+
+    if "openrouter" not in db.get_api_key_ciphertexts():
+        return False
+    db.delete_api_key("openrouter")
+    return True
+
+
 def clear_all_api_keys() -> None:
     """Clear all API keys from the encrypted store and any legacy config slots."""
     from app.database import db
