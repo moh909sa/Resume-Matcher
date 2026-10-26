@@ -38,6 +38,7 @@ from app.routers import (
     writing_router,
 )
 from app.routers.resumes import drain_processing_cleanup_tasks
+from app.routers.mobile_tailoring import router as mobile_tailoring_router
 from app.services.supabase_backend import ResumeQuotaExceeded, SupabaseUnavailable
 
 
@@ -165,6 +166,7 @@ app.add_middleware(HostGuardMiddleware, allowed_hosts=settings.effective_allowed
 # Include routers
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(mobile_router, prefix="/api/v1")
+app.include_router(mobile_tailoring_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
 app.include_router(resumes_router, prefix="/api/v1")
 app.include_router(jobs_router, prefix="/api/v1")

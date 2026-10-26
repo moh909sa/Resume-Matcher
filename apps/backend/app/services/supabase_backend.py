@@ -204,6 +204,57 @@ class SupabaseBackend:
             },
         )
 
+    async def create_tailored_record(self, values: dict[str, Any]) -> dict[str, Any]:
+        response = await self._request(
+            "POST", "/rest/v1/user_tailored_cvs",
+            headers={"Prefer": "return=representation"}, json=values,
+        )
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise SupabaseUnavailable("Invalid tailored CV registry response")
+        return rows[0]
+
+    async def list_tailored_records(self, user_id: str) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET", "/rest/v1/user_tailored_cvs",
+            params={"user_id": f"eq.{UUID(user_id)}", "select": "*",
+                    "order": "created_at.desc", "limit": "100"},
+        )
+        rows = self._json(response)
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or row.get("user_id") != user_id for row in rows
+        ):
+            raise SupabaseUnavailable("Invalid tailored CV registry response")
+        return rows
+
+    async def get_tailored_record(
+        self, user_id: str, tailoring_id: str
+    ) -> dict[str, Any] | None:
+        response = await self._request(
+            "GET", "/rest/v1/user_tailored_cvs",
+            params={"user_id": f"eq.{UUID(user_id)}",
+                    "id": f"eq.{UUID(tailoring_id)}", "select": "*"},
+        )
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise SupabaseUnavailable("Invalid tailored CV registry response")
+        if not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, dict) or row.get("user_id") != user_id or row.get("id") != tailoring_id:
+            raise SupabaseUnavailable("Invalid tailored CV registry response")
+        return row
+
+    async def update_tailored_record(
+        self, user_id: str, tailoring_id: str, changes: dict[str, Any]
+    ) -> None:
+        await self._request(
+            "PATCH", "/rest/v1/user_tailored_cvs",
+            params={"user_id": f"eq.{UUID(user_id)}",
+                    "id": f"eq.{UUID(tailoring_id)}"},
+            json=changes,
+        )
+
     async def upload_original(self, path: str, content: bytes, mime_type: str) -> None:
         await self._request(
             "POST",
