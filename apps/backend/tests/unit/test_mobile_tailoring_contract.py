@@ -7,16 +7,39 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from unittest.mock import AsyncMock
 
-from app.routers.mobile_tailoring import MobileTailorRequest, preview_mobile_tailor
+from app.routers.mobile_tailoring import (
+    MobileTailorRequest,
+    _preview_length_options,
+    preview_mobile_tailor,
+)
 
 
-def test_defaults_are_full_tailoring_two_pages_five_bullets():
+def test_defaults_are_full_tailoring_unlimited_pages_and_all_bullets():
     request = MobileTailorRequest(
         resume_id=uuid4(), job_description="Senior engineer required. " * 4
     )
-    assert request.max_pages == 2
-    assert request.max_bullets_per_entry == 5
+    assert request.max_pages is None
+    assert request.max_bullets_per_entry is None
+    # Crucial: passing neither preference must SKIP both page fitting and truncation.
+    assert _preview_length_options(request) == {}
     assert not hasattr(request, "prompt_id")
+
+
+def test_optional_explicit_length_limits_are_applied_only_when_requested():
+    request = MobileTailorRequest(
+        resume_id=uuid4(),
+        job_description="Senior engineer required. " * 4,
+        max_pages=3,
+        max_bullets_per_entry=3,
+    )
+    options = _preview_length_options(request)
+    assert options["max_pages"] == 3
+    assert options["max_bullets_per_entry"] == 3
+    assert options["page_fit"].pageSize == "A4"
+
+    bullet_only = request.model_copy(update={"max_pages": None})
+    assert "page_fit" not in _preview_length_options(bullet_only)
+    assert "max_pages" not in _preview_length_options(bullet_only)
 
 
 @pytest.mark.parametrize("options", [

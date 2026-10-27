@@ -26,12 +26,12 @@ router = APIRouter(prefix="/mobile", tags=["mobile-tailoring"], route_class=AIOp
 
 
 class MobileTailorRequest(BaseModel):
-    """Full tailoring is a server-enforced choice; clients may change only length."""
+    """Full tailoring is server-enforced; no cap is the default for both limits."""
 
     resume_id: UUID
     job_description: str = Field(min_length=50, max_length=12000)
-    max_pages: Literal[2, 3] = 2
-    max_bullets_per_entry: Literal[3, 5] = 5
+    max_pages: Literal[2, 3] | None = None
+    max_bullets_per_entry: Literal[3, 5] | None = None
 
     @field_validator("job_description")
     @classmethod
@@ -40,6 +40,17 @@ class MobileTailorRequest(BaseModel):
         if len(text) < 50:
             raise ValueError("Paste at least 50 characters from the job posting")
         return text
+
+
+def _preview_length_options(body: MobileTailorRequest) -> dict[str, Any]:
+    """No limit (None) means no forced page fitting or bullet truncation."""
+    options: dict[str, Any] = {}
+    if body.max_pages is not None:
+        options["max_pages"] = body.max_pages
+        options["page_fit"] = PageFitSettings(template="swiss-single", pageSize="A4")
+    if body.max_bullets_per_entry is not None:
+        options["max_bullets_per_entry"] = body.max_bullets_per_entry
+    return options
 
 
 def _summary(record: dict[str, Any]) -> dict[str, Any]:
@@ -89,9 +100,7 @@ async def preview_mobile_tailor(
                     resume_id=source_id,
                     job_id=job_id,
                     prompt_id="full",
-                    max_pages=body.max_pages,
-                    max_bullets_per_entry=body.max_bullets_per_entry,
-                    page_fit=PageFitSettings(template="swiss-single", pageSize="A4"),
+                    **_preview_length_options(body),
                 )
             )
             data = preview.data.model_dump(mode="json")
