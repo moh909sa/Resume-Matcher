@@ -47,7 +47,9 @@ def test_finished_is_based_on_actual_stages_not_fake_100_percent():
         assert timeline["current_step"] is None
         assert timeline["completed_steps"] == ["read_job", "tailor_resume"]
         assert "rewrite_lines" not in timeline["completed_steps"]
-    assert get_progress_history(progress_id) is not None
+    # Synchronous test contexts have no running event loop, so registration
+    # is released immediately; async API calls retain the entry briefly.
+    assert get_progress_history(progress_id) is None
 
 
 def test_mobile_progress_request_is_optional_and_uuid_typed():
