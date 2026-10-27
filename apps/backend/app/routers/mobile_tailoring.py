@@ -30,7 +30,7 @@ from app.services.mobile_progress import (
     finished_progress_update,
     mirror_engine_stages,
 )
-from app.services.supabase_backend import SupabaseBackend, SupabaseUnavailable
+from app.services.supabase_backend import MobileJobConflict, SupabaseBackend, SupabaseUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,82 @@ async def _owned_tailoring(
     return record
 
 
+def _public_job(row: dict[str, Any]) -> dict[str, Any]:
+    """Exclude job description, private CV data and worker credentials."""
+    return {
+        "progress_id": row["id"],
+        "status": row["status"],
+        "tailoring_id": row.get("tailoring_id"),
+        "current_step": row.get("current_step"),
+        "completed_steps": row.get("completed_steps") or [],
+        "visited_steps": row.get("visited_steps") or [],
+        "error_code": row.get("error_code"),
+        "started_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+@router.post("/tailor/jobs", status_code=202)
+async def enqueue_mobile_tailor(
+    body: MobileTailorRequest,
+    user_id: str = Depends(current_user),
+    backend: SupabaseBackend = Depends(supabase_backend),
+) -> dict[str, Any]:
+    """Idempotently enqueue a durable AI job and return immediately to iOS."""
+    source_id = str(body.resume_id)
+    if await backend.get_record(user_id, source_id) is None:
+        raise HTTPException(status_code=404, detail="Original CV not found")
+    with resume_owner(user_id):
+        source = await db.get_resume(source_id)
+        if not source or source.get("processing_status") != "ready":
+            raise HTTPException(status_code=409, detail="CV must be Ready before tailoring")
+    if body.progress_id is None:
+        raise HTTPException(status_code=422, detail="A unique progress_id UUID is required")
+    try:
+        job = await backend.enqueue_mobile_tailoring(
+            user_id, str(body.progress_id), source_id, body.job_description,
+            body.max_pages, body.max_bullets_per_entry)
+    except MobileJobConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {**_public_job(job), "queued": job["status"] == "queued"}
+
+
+@router.get("/tailor/jobs/recent")
+async def recent_mobile_tailor_jobs(
+    user_id: str = Depends(current_user),
+    backend: SupabaseBackend = Depends(supabase_backend),
+) -> dict[str, Any]:
+    """Recover interrupted navigation or app relaunch from durable server state."""
+    jobs = await backend.list_mobile_jobs(user_id, limit=10)
+    return {"jobs": [_public_job(job) for job in jobs]}
+
+
+@router.get("/tailor/jobs/{progress_id}/result")
+async def completed_mobile_tailor_result(
+    progress_id: UUID,
+    user_id: str = Depends(current_user),
+    backend: SupabaseBackend = Depends(supabase_backend),
+) -> dict[str, Any]:
+    """Recover the already-generated preview; never start another paid AI run."""
+    progress = await backend.get_mobile_progress(user_id, str(progress_id))
+    if progress is None:
+        raise HTTPException(status_code=404, detail="Tailoring job not found")
+    if progress["status"] != "succeeded" or not progress.get("tailoring_id"):
+        raise HTTPException(status_code=409, detail="Tailoring job has not completed successfully")
+    record = await backend.get_tailored_record(user_id, progress["tailoring_id"])
+    if record is None or record["status"] != "draft":
+        raise HTTPException(status_code=409, detail="Tailored preview already saved or unavailable")
+    data = record.get("preview_json") or {}
+    if record.get("preview_id") != data.get("preview_id"):
+        raise HTTPException(status_code=409, detail="Tailored preview unavailable")
+    return {"tailoring_id": record["id"], "progress_id": str(progress_id),
+            "status": "draft", "preview": data,
+            "review": _review_ui(data),
+            "preferences": {"max_pages": record.get("max_pages"),
+                            "max_bullets_per_entry": record.get("max_bullets_per_entry"),
+                            "tailoring_intensity": "full"}}
+
+
 @router.get("/tailor/progress/{progress_id}")
 async def get_mobile_tailor_progress(
     progress_id: UUID,
@@ -154,6 +230,7 @@ async def get_mobile_tailor_progress(
         "completed_steps": row.get("completed_steps") or [],
         "visited_steps": row.get("visited_steps") or [],
         "tailoring_id": row.get("tailoring_id"),
+        "error_code": row.get("error_code"),
         "started_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }

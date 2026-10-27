@@ -78,10 +78,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.services.queue_worker import queue_manager
 
     await queue_manager.start()
+    from app.services.mobile_jobs import mobile_tailoring_worker
+    mobile_tailoring_worker.start()
     # PDF renderer uses lazy initialization - will initialize on first use
     # await init_pdf_renderer()
     yield
-    # Shutdown - wrap each cleanup in try-except to ensure all resources are released
+    # Shutdown - stop durable queue tasks before closing database connections.
+    try:
+        await mobile_tailoring_worker.stop()
+    except Exception:
+        logger.exception("Error stopping mobile tailoring worker")
     try:
         await queue_manager.stop()
     except Exception:

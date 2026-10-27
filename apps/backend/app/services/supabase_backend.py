@@ -14,6 +14,14 @@ BUCKET = "resume-files"
 MAX_ORIGINAL_BYTES = 4 * 1024 * 1024
 
 
+class MobileJobConflict(RuntimeError):
+    """An existing active job belongs to this user."""
+
+
+class MobileJobLeaseLost(RuntimeError):
+    """A different worker or recovered run owns the lease."""
+
+
 class SupabaseUnavailable(RuntimeError):
     """The trusted upstream could not complete an operation."""
 
@@ -206,6 +214,183 @@ class SupabaseBackend:
             },
         )
 
+    async def enqueue_mobile_tailoring(
+        self, user_id: str, progress_id: str, resume_id: str,
+        job_description: str, max_pages: int | None,
+        max_bullets_per_entry: int | None,
+    ) -> dict[str, Any]:
+        """Idempotent queue insert; only one active mobile job per user."""
+        # Returning a newly generated client UUID after losing the response must
+        # not trigger another billed AI request for an identical recent preview.
+        recent = await self.list_mobile_jobs(user_id, limit=10)
+        for previous in recent:
+            if previous.get("source_resume_id") != resume_id or previous.get("job_description") != job_description:
+                continue
+            if previous.get("max_pages") != max_pages or previous.get("max_bullets_per_entry") != max_bullets_per_entry:
+                continue
+            if previous["id"] == progress_id or previous.get("status") in ("queued", "running"):
+                return previous
+            if previous.get("status") == "succeeded" and previous.get("tailoring_id"):
+                created = datetime.fromisoformat(previous["created_at"].replace("Z", "+00:00"))
+                if datetime.now(timezone.utc) - created < timedelta(minutes=15):
+                    return previous
+        values = {
+            "id": str(UUID(progress_id)), "user_id": str(UUID(user_id)),
+            "source_resume_id": str(UUID(resume_id)),
+            "job_description": job_description,
+            "max_pages": max_pages, "max_bullets_per_entry": max_bullets_per_entry,
+            "status": "queued", "stage": "queued",
+        }
+        try:
+            response = await self._request(
+                "POST", "/rest/v1/user_tailoring_progress",
+                headers={"Prefer": "return=representation"}, json=values)
+            rows = self._json(response)
+            if not isinstance(rows, list) or len(rows) != 1:
+                raise SupabaseUnavailable("Invalid queue insert")
+            return rows[0]
+        except SupabaseUnavailable:
+            # A replay with the same id or a double tap with a new id must
+            # NEVER create a second AI operation. Check ownership and payload.
+            matching = await self.get_mobile_job(user_id, progress_id)
+            if matching is None:
+                active = await self.list_mobile_jobs(user_id, limit=10)
+                matching = next(
+                    (job for job in active if job.get("status") in ("queued", "running")), None
+                )
+            if (
+                matching
+                and matching.get("source_resume_id") == resume_id
+                and matching.get("job_description") == job_description
+                and matching.get("max_pages") == max_pages
+                and matching.get("max_bullets_per_entry") == max_bullets_per_entry
+            ):
+                return matching
+            if matching:
+                raise MobileJobConflict("Another tailoring request is already in progress")
+            raise
+
+    async def get_mobile_job(self, user_id: str, progress_id: str) -> dict[str, Any] | None:
+        """Only trusted server code accesses full private queue inputs."""
+        response = await self._request(
+            "GET", "/rest/v1/user_tailoring_progress",
+            params={"user_id": f"eq.{UUID(user_id)}", "id": f"eq.{UUID(progress_id)}",
+                    "select": "*"})
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise SupabaseUnavailable("Invalid queue lookup")
+        return rows[0] if rows and rows[0].get("user_id") == user_id else None
+
+    async def list_mobile_jobs(self, user_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET", "/rest/v1/user_tailoring_progress",
+            params={"user_id": f"eq.{UUID(user_id)}",
+                    "job_description": "not.is.null",
+                    "select": "*", "order": "created_at.desc",
+                    "limit": str(min(limit, 20))})
+        rows = self._json(response)
+        if not isinstance(rows, list) or any(row.get("user_id") != user_id for row in rows):
+            raise SupabaseUnavailable("Invalid queue listing")
+        return rows
+
+    async def pending_mobile_jobs(self) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET", "/rest/v1/user_tailoring_progress",
+            params={"status": "eq.queued", "job_description": "not.is.null",
+                    "select": "id,user_id", "order": "created_at.asc", "limit": "5"})
+        rows = self._json(response)
+        if not isinstance(rows, list):
+            raise SupabaseUnavailable("Invalid queue listing")
+        return rows
+
+    async def claim_mobile_job(self, user_id: str, progress_id: str) -> dict[str, Any] | None:
+        token = str(uuid4())
+        now = datetime.now(timezone.utc)
+        response = await self._request(
+            "PATCH", "/rest/v1/user_tailoring_progress",
+            params={"id": f"eq.{UUID(progress_id)}", "user_id": f"eq.{UUID(user_id)}",
+                    "status": "eq.queued", "job_description": "not.is.null"},
+            headers={"Prefer": "return=representation"},
+            json={"status": "running", "stage": "starting", "claim_token": token,
+                  "lease_until": (now + timedelta(minutes=3)).isoformat(),
+                  "attempts": 1, "updated_at": now.isoformat()})
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise SupabaseUnavailable("Invalid job claim")
+        return rows[0] if rows else None
+
+    async def heartbeat_mobile_job(self, job: dict[str, Any]) -> None:
+        response = await self._request(
+            "PATCH", "/rest/v1/user_tailoring_progress",
+            params={"id": f"eq.{UUID(job['id'])}",
+                    "user_id": f"eq.{UUID(job['user_id'])}",
+                    "status": "eq.running",
+                    "claim_token": f"eq.{UUID(job['claim_token'])}"},
+            headers={"Prefer": "return=representation"},
+            json={"lease_until": (datetime.now(timezone.utc) + timedelta(minutes=3)).isoformat(),
+                  "updated_at": datetime.now(timezone.utc).isoformat()})
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise MobileJobLeaseLost("Background job lease is no longer active")
+
+    async def finish_mobile_job(
+        self, job: dict[str, Any], status: str,
+        *, tailoring_id: str | None = None, error_code: str | None = None,
+        timeline: dict[str, Any] | None = None,
+    ) -> None:
+        if status not in ("succeeded", "failed", "interrupted"):
+            raise ValueError("Invalid final mobile job state")
+        now = datetime.now(timezone.utc).isoformat()
+        response = await self._request(
+            "PATCH", "/rest/v1/user_tailoring_progress",
+            params={"id": f"eq.{UUID(job['id'])}",
+                    "user_id": f"eq.{UUID(job['user_id'])}",
+                    "status": "eq.running",
+                    "claim_token": f"eq.{UUID(job['claim_token'])}"},
+            headers={"Prefer": "return=representation"},
+            json={"status": status, "stage": status,
+                  "claim_token": None, "lease_until": None, "error_code": error_code,
+                  "tailoring_id": tailoring_id, "finished_at": now,
+                  "updated_at": now, **(timeline or {})})
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise MobileJobLeaseLost("Background job state changed")
+
+    async def find_tailored_for_progress(self, user_id: str, progress_id: str) -> dict[str, Any] | None:
+        response = await self._request(
+            "GET", "/rest/v1/user_tailored_cvs",
+            params={"user_id": f"eq.{UUID(user_id)}",
+                    "progress_id": f"eq.{UUID(progress_id)}",
+                    "select": "id", "limit": "1"})
+        rows = self._json(response)
+        if not isinstance(rows, list):
+            raise SupabaseUnavailable("Invalid result lookup")
+        return rows[0] if rows else None
+
+    async def mark_stale_mobile_jobs(self) -> None:
+        """Never silently regenerate an AI preview that may already have been billed."""
+        now = datetime.now(timezone.utc).isoformat()
+        response = await self._request(
+            "GET", "/rest/v1/user_tailoring_progress",
+            params={"status": "eq.running", "job_description": "not.is.null",
+                    "lease_until": f"lt.{now}", "select": "id,user_id,claim_token",
+                    "limit": "10"})
+        for job in self._json(response):
+            existing = await self.find_tailored_for_progress(job["user_id"], job["id"])
+            # Fence against a worker that recovered its heartbeat in the meantime.
+            await self._request(
+                "PATCH", "/rest/v1/user_tailoring_progress",
+                params={"id": f"eq.{UUID(job['id'])}", "status": "eq.running",
+                        "claim_token": f"eq.{UUID(job['claim_token'])}",
+                        "lease_until": f"lt.{now}"},
+                json={"status": "succeeded" if existing else "interrupted",
+                      "tailoring_id": existing["id"] if existing else None,
+                      "error_code": None if existing else "worker_interrupted",
+                      "stage": "complete" if existing else "interrupted",
+                      "finished_at": now, "updated_at": now,
+                      "claim_token": None, "lease_until": None,
+                      "current_step": None})
+
     async def create_mobile_progress(
         self, user_id: str, progress_id: str, resume_id: str
     ) -> None:
@@ -236,7 +421,7 @@ class SupabaseBackend:
                 "id": f"eq.{UUID(progress_id)}",
                 "select": (
                     "id,user_id,status,stage,current_step,completed_steps,"
-                    "visited_steps,tailoring_id,created_at,updated_at,finished_at"
+                    "visited_steps,tailoring_id,created_at,updated_at,finished_at,error_code"
                 ),
             },
         )
