@@ -12,6 +12,7 @@ from app.database import db
 from app.mobile_access import current_user, supabase_backend
 from app.resume_ownership import resume_owner
 from app.routers.resumes import (
+    apply_keywords_endpoint,
     improve_resume_confirm_endpoint,
     improve_resume_preview_endpoint,
 )
@@ -20,6 +21,8 @@ from app.schemas.models import (
     ImproveResumeRequest,
     PageFitSettings,
 )
+from app.schemas.models import ResumeData
+from app.schemas.writing import ApplyKeywordsRequest, ForcedKeyword
 from app.services.supabase_backend import SupabaseBackend
 
 router = APIRouter(prefix="/mobile", tags=["mobile-tailoring"], route_class=AIOperationRoute)
@@ -40,6 +43,56 @@ class MobileTailorRequest(BaseModel):
         if len(text) < 50:
             raise ValueError("Paste at least 50 characters from the job posting")
         return text
+
+
+class MobileApplyKeywordsRequest(BaseModel):
+    expected_preview_id: str = Field(min_length=1, max_length=100)
+    keywords: list[ForcedKeyword] = Field(min_length=1, max_length=30)
+
+
+def _keyword_options(preview: dict[str, Any]) -> dict[str, Any]:
+    ats = preview.get("ats_score") or {}
+    supported = ats.get("injectable_keywords") or []
+    missing = ats.get("missing_keywords") or []
+    applied = preview.get("forced_keywords") or []
+    used = {str(x).casefold() for x in applied}
+    possible = {str(x).casefold() for x in supported}
+    def not_used(items: list[str]) -> list[str]:
+        return [x for x in items if x.casefold() not in used]
+    return {
+        "supported": not_used(supported),
+        "needs_attestation": not_used([x for x in missing if x.casefold() not in possible]),
+        "applied": applied,
+        "remaining_slots": max(0, 30 - len(used)),
+    }
+
+
+def _review_ui(preview: dict[str, Any]) -> dict[str, Any]:
+    summary = preview.get("diff_summary") or {}
+    sections: dict[str, list[dict[str, Any]]] = {}
+    for change in preview.get("detailed_changes") or []:
+        if isinstance(change, dict) and isinstance(change.get("field_type"), str):
+            sections.setdefault(change["field_type"], []).append(change)
+    return {
+        "step_order": ["keywords", "changes", "confirm"],
+        "preview_id": preview.get("preview_id"),
+        "preview_expires_at": preview.get("preview_expires_at"),
+        "keyword_options": _keyword_options(preview),
+        "ats_score": preview.get("ats_score"),
+        "score_history": (preview.get("_mobile") or {}).get("ats_history") or [],
+        "keyword_placements": preview.get("keyword_placements") or [],
+        "change_summary": {key: summary.get(key, 0) for key in (
+            "skills_added", "skills_removed", "certifications_added",
+            "descriptions_modified", "high_risk_changes", "total_changes"
+        )},
+        "change_sections": [
+            {"type": kind, "items": sections[kind]}
+            for kind in ("summary", "skill", "experience", "description",
+                         "education", "project", "certification", "language", "award")
+            if kind in sections
+        ],
+        "warnings": preview.get("warnings") or [],
+    }
 
 
 def _preview_length_options(body: MobileTailorRequest) -> dict[str, Any]:
@@ -106,6 +159,9 @@ async def preview_mobile_tailor(
             data = preview.data.model_dump(mode="json")
             if not data.get("preview_id"):
                 raise HTTPException(status_code=503, detail="Tailoring preview was not registered")
+            score = (data.get("ats_score") or {}).get("overall_score")
+            if isinstance(score, (int, float)):
+                data["_mobile"] = {"ats_history": [score]}
             stored = await backend.create_tailored_record({
                 "user_id": user_id,
                 "source_resume_id": source_id,
@@ -126,9 +182,109 @@ async def preview_mobile_tailor(
             await db.delete_job(job_id)
             raise
     return {"tailoring_id": stored["id"], "status": "draft", "preview": data,
+            "review": _review_ui(data),
             "preferences": {"max_pages": body.max_pages,
                             "max_bullets_per_entry": body.max_bullets_per_entry,
                             "tailoring_intensity": "full"}}
+
+
+@router.get("/tailor/{tailoring_id}/review")
+async def get_mobile_tailor_review(
+    tailoring_id: UUID,
+    user_id: str = Depends(current_user),
+    backend: SupabaseBackend = Depends(supabase_backend),
+) -> dict[str, Any]:
+    """Reload the owner's latest saved draft after navigation or app relaunch."""
+    record = await _owned_tailoring(backend, user_id, tailoring_id)
+    if record["status"] != "draft":
+        raise HTTPException(status_code=409, detail="Tailored CV has already been saved")
+    preview = record.get("preview_json") or {}
+    if preview.get("preview_id") != record.get("preview_id"):
+        raise HTTPException(status_code=409, detail="Draft preview is unavailable")
+    return {"tailoring_id": str(tailoring_id), "status": "draft",
+            "preview": preview, "review": _review_ui(preview)}
+
+
+@router.post("/tailor/{tailoring_id}/keywords")
+async def apply_mobile_tailor_keywords(
+    tailoring_id: UUID,
+    body: MobileApplyKeywordsRequest,
+    user_id: str = Depends(current_user),
+    backend: SupabaseBackend = Depends(supabase_backend),
+) -> dict[str, Any]:
+    """Apply real job keywords repeatedly without changing the original CV."""
+    record = await _owned_tailoring(backend, user_id, tailoring_id)
+    if record["status"] != "draft" or record.get("preview_id") != body.expected_preview_id:
+        raise HTTPException(status_code=409, detail="Draft changed. Refresh review")
+    current = record.get("preview_json") or {}
+    if current.get("preview_id") != body.expected_preview_id or not current.get("resume_preview"):
+        raise HTTPException(status_code=409, detail="Draft preview is unavailable")
+    expiry = record.get("preview_expires_at")
+    if not expiry or datetime.fromisoformat(expiry.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail="Preview expired. Generate a new draft")
+    source_id = record.get("source_resume_id")
+    if not source_id or await backend.get_record(user_id, source_id) is None:
+        raise HTTPException(status_code=409, detail="Original CV is unavailable")
+    options = _keyword_options(current)
+    applied = {str(x).casefold() for x in options["applied"]}
+    selected = [x.keyword.strip().casefold() for x in body.keywords]
+    if len(set(selected)) != len(selected) or any(x in applied or not x for x in selected):
+        raise HTTPException(status_code=422, detail="Choose only new, distinct keywords")
+    if len(applied) + len(selected) > 30:
+        raise HTTPException(status_code=422, detail="Maximum 30 keywords per draft")
+    supported = {x.casefold() for x in options["supported"]}
+    needs_attestation = {x.casefold() for x in options["needs_attestation"]}
+    for item in body.keywords:
+        key = item.keyword.strip().casefold()
+        if key not in supported and key not in needs_attestation:
+            raise HTTPException(status_code=422, detail="Choose suggested job keywords only")
+        if key in needs_attestation and not item.attested:
+            raise HTTPException(status_code=422, detail="Confirm 'I have this' for new skills")
+
+    token = await backend.claim_tailored_operation(user_id, str(tailoring_id), body.expected_preview_id)
+    if not token:
+        raise HTTPException(status_code=409, detail="Another tailoring operation is running")
+    try:
+        with resume_owner(user_id):
+            source = await db.get_resume(source_id)
+            job = await db.get_job(record["job_id"])
+            if not source or not job or job.get("resume_id") != source_id:
+                raise HTTPException(status_code=409, detail="Tailoring source was removed")
+            result = await apply_keywords_endpoint(ApplyKeywordsRequest(
+                resume_id=source_id, job_id=record["job_id"],
+                preview_id=body.expected_preview_id,
+                improved_data=ResumeData.model_validate(current["resume_preview"]),
+                keywords=body.keywords, prompt_id="full",
+            ))
+        data = result.data.model_dump(mode="json")
+        if not data.get("preview_id") or data["preview_id"] == body.expected_preview_id:
+            raise HTTPException(status_code=503, detail="Engine did not register a new preview")
+        # Preserve placements across multiple keyword iterations.
+        previous = current.get("keyword_placements") or []
+        recent = data.get("keyword_placements") or []
+        placements = {x["keyword"].casefold(): x for x in previous + recent
+                      if isinstance(x, dict) and isinstance(x.get("keyword"), str)}
+        data["keyword_placements"] = list(placements.values())
+        merged: dict[str, str] = {}
+        for key in (current.get("forced_keywords") or []) + (data.get("forced_keywords") or []):
+            if isinstance(key, str):
+                merged[key.casefold()] = key
+        data["forced_keywords"] = list(merged.values())
+        scores = list((current.get("_mobile") or {}).get("ats_history") or [])
+        score = (data.get("ats_score") or {}).get("overall_score")
+        if isinstance(score, (int, float)):
+            scores.append(score)
+        data["_mobile"] = {"ats_history": scores[-31:]}
+        await backend.finish_tailored_operation(user_id, str(tailoring_id), token, {
+            "preview_id": data["preview_id"],
+            "preview_expires_at": data.get("preview_expires_at"),
+            "preview_json": data,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+    finally:
+        await backend.release_tailored_operation(user_id, str(tailoring_id), token)
+    return {"tailoring_id": str(tailoring_id), "status": "draft",
+            "preview": data, "review": _review_ui(data)}
 
 
 @router.post("/tailor/{tailoring_id}/confirm")
@@ -155,32 +311,37 @@ async def confirm_mobile_tailor(
     if not saved.get("preview_id") or saved.get("preview_id") != record.get("preview_id"):
         raise HTTPException(status_code=409, detail="Stored preview is incomplete")
 
-    with resume_owner(user_id):
-        source = await db.get_resume(source_id)
-        job = await db.get_job(record["job_id"])
-        if not source or not job or job.get("resume_id") != source_id:
-            raise HTTPException(status_code=409, detail="Preview source is no longer available")
-        result = await improve_resume_confirm_endpoint(
-            ImproveResumeConfirmRequest(
-                resume_id=source_id,
-                job_id=record["job_id"],
-                preview_id=record["preview_id"],
-                improved_data=saved["resume_preview"],
-                improvements=saved.get("improvements", []),
+    token = await backend.claim_tailored_operation(user_id, str(tailoring_id), record["preview_id"])
+    if not token:
+        raise HTTPException(status_code=409, detail="Another tailoring operation is running")
+    try:
+        with resume_owner(user_id):
+            source = await db.get_resume(source_id)
+            job = await db.get_job(record["job_id"])
+            if not source or not job or job.get("resume_id") != source_id:
+                raise HTTPException(status_code=409, detail="Preview source is no longer available")
+            result = await improve_resume_confirm_endpoint(
+                ImproveResumeConfirmRequest(
+                    resume_id=source_id,
+                    job_id=record["job_id"],
+                    preview_id=record["preview_id"],
+                    improved_data=saved["resume_preview"],
+                    improvements=saved.get("improvements", []),
+                    forced_keywords=saved.get("forced_keywords", []),
+                    master_skills_to_add=[],  # Never mutate the original CV.
+                )
             )
-        )
         output = result.data.model_dump(mode="json")
         engine_id = output.get("resume_id")
         if not engine_id:
             raise HTTPException(status_code=503, detail="Tailored CV was not saved")
-        # Engine confirmation is idempotent; retry this call after transient
-        # Supabase failures to persist the already-confirmed result.
-        await backend.update_tailored_record(user_id, str(tailoring_id), {
-            "engine_resume_id": str(UUID(engine_id)),
-            "status": "ready",
+        await backend.finish_tailored_operation(user_id, str(tailoring_id), token, {
+            "engine_resume_id": str(UUID(engine_id)), "status": "ready",
             "result_json": output,
             "updated_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }, final_status="ready")
+    finally:
+        await backend.release_tailored_operation(user_id, str(tailoring_id), token)
     return {"tailoring_id": str(tailoring_id), "status": "ready", "tailored_cv": output}
 
 

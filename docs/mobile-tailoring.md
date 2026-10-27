@@ -21,13 +21,63 @@ Base path: `/api/v1/mobile`. Do not call legacy `/api/v1/jobs` or
    * Page fitting runs only when a page cap is explicitly requested. When
      requested, it uses a short-lived print draft and a loopback-only
      internal API route. Show any warnings; never promise an exact page count.
-4. Show the preview/diff for user review; DO NOT auto-confirm.
+4. **Review wizard:** Once POST /tailor/preview succeeds, automatically open the
+   iOS review flow, with no additional "open review" button. The previous AI
+   processing screen transitions only when the API returns successfully.
+   Client should use the additive `review` field (and original `preview`
+   remains intact), or call `GET /tailor/{tailoring_id}/review` to reload
+   the authenticated owner's current draft. It provides:
+   - `step_order`: `["keywords","changes","confirm"]`
+   - `preview_id` and `preview_expires_at`
+   - `keyword_options.supported`, `needs_attestation`, `applied`, `remaining_slots`
+   - `ats_score`, `score_history` and real `keyword_placements`
+   - `change_summary` five color-card counts + total, and `change_sections`
+     with real section-specific Before/After changes
+   - `warnings` for incomplete diffs or other engine concerns.
+
+   **Step 1 — Optimize Keywords**
+   * Show ATS *estimate* from the engine, not a fabricated score. The score may
+     rise, fall, or remain unchanged after each application.
+   * Show `supported` skills as existing master skills that could be highlighted;
+     `needs_attestation` items require explicit user affirmation "I have this".
+     Clearly warn: "Select only skills you genuinely have; expect questions
+     about them in interviews." A checkbox selection is never an automatic
+     claim about the original CV.
+   * POST `/tailor/{tailoring_id}/keywords` with JSON:
+     `{"expected_preview_id":"<current preview.preview_id>","keywords":[{"keyword":"OPC-UA","attested":true}]}`
+   * For supported terms, use `attested:false`; for missing-from-master
+     terms user must choose `attested:true`. The server validates ownership,
+     latest preview, and whether each term appears in the JOB's suggestions.
+   * Returns an updated unsaved `preview`, `review`, and a **new preview_id**.
+     Render the new ATS estimate, placements, summary cards, and updated
+     suggestions immediately. The user can apply again with the NEW preview_id,
+     or skip keywords and press "Continue".
+   * Never keep using an old preview_id or invent improvement percentages.
+     Max 30 distinct applied keywords per draft. A 409 means the preview is
+     stale, expired or another request is running: fetch /review to refresh.
+     422 means invalid/repeated/unsupported keyword selection.
+   * The original CV is NOT changed. Do NOT show or implement a "Also add to
+     master" default; this feature intentionally operates only on the draft.
+
+   **Step 2 — Review Changes**
+   * Display `change_summary` cards for Skills Added / Skills Removed /
+     Certifications Added / Descriptions Modified / High Risk Changes.
+   * Expand `change_sections` in clear, mobile-friendly accordions; show
+     old and new text, additions/deletions, and high-risk warnings.
+     Missing diff data is a warning, not implicit acceptance.
+   * User can go back to Keywords and apply more, then review the *latest* diff.
+
+   **Step 3 — Confirm & Save**
+   * Explain that the user's original CV remains unchanged.
+   * User explicitly taps Confirm & Save. No automatic confirmation.
+   * Handle temporary busy / retriable 409 states; never save an older preview.
+
 5. On approval: POST `/tailor/{tailoring_id}/confirm` with no JSON body.
-   The server confirms the exact stored draft and returns `status=ready` and
+   The server atomically claims and confirms the latest stored draft and returns `status=ready` and
    `tailored_cv`. Retry after transient failures; confirmation is replay-safe.
 6. GET `/tailored-cvs` lists owned saved/draft CVs (without large content).
    GET `/tailored-cvs/{tailoring_id}` returns the owned preview/result.
-   The original CV is not overwritten.
+   The original CV is not overwritten. Concurrent keyword/confirm requests are serialized with a crash-recoverable 15-minute database lease.
 
 For preview errors, no fake output is stored. Jobs linked to unusable previews
 are cleaned up. Expired previews require generating a new one. Both authentication

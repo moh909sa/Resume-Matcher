@@ -2,6 +2,8 @@
 
 import logging
 from typing import Any
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 from urllib.parse import quote
 from uuid import UUID
 
@@ -253,6 +255,64 @@ class SupabaseBackend:
             params={"user_id": f"eq.{UUID(user_id)}",
                     "id": f"eq.{UUID(tailoring_id)}"},
             json=changes,
+        )
+
+    async def claim_tailored_operation(
+        self, user_id: str, tailoring_id: str, expected_preview_id: str
+    ) -> str | None:
+        """Atomic lease: serialize keyword applies and confirmation across workers."""
+        token = str(uuid4())
+        now = datetime.now(timezone.utc)
+        response = await self._request(
+            "PATCH", "/rest/v1/user_tailored_cvs",
+            params={
+                "user_id": f"eq.{UUID(user_id)}",
+                "id": f"eq.{UUID(tailoring_id)}",
+                "status": "eq.draft",
+                "preview_id": f"eq.{expected_preview_id}",
+                "or": f"(operation_until.is.null,operation_until.lt.{now.isoformat()})",
+            },
+            headers={"Prefer": "return=representation"},
+            json={"operation_token": token,
+                  "operation_until": (now + timedelta(minutes=15)).isoformat()},
+        )
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise SupabaseUnavailable("Invalid tailoring lease response")
+        return token if rows else None
+
+    async def finish_tailored_operation(
+        self, user_id: str, tailoring_id: str, token: str,
+        changes: dict[str, Any], *, final_status: str = "draft",
+    ) -> None:
+        response = await self._request(
+            "PATCH", "/rest/v1/user_tailored_cvs",
+            params={
+                "user_id": f"eq.{UUID(user_id)}",
+                "id": f"eq.{UUID(tailoring_id)}",
+                "status": "eq.draft",
+                "operation_token": f"eq.{UUID(token)}",
+            },
+            headers={"Prefer": "return=representation"},
+            json={**changes, "status": final_status,
+                  "operation_token": None, "operation_until": None},
+        )
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise SupabaseUnavailable("Tailoring changed during this operation")
+
+    async def release_tailored_operation(
+        self, user_id: str, tailoring_id: str, token: str
+    ) -> None:
+        """Release only our lock; cannot clear a new worker's claim."""
+        await self._request(
+            "PATCH", "/rest/v1/user_tailored_cvs",
+            params={
+                "user_id": f"eq.{UUID(user_id)}",
+                "id": f"eq.{UUID(tailoring_id)}",
+                "operation_token": f"eq.{UUID(token)}",
+            },
+            json={"operation_token": None, "operation_until": None},
         )
 
     async def upload_original(self, path: str, content: bytes, mime_type: str) -> None:
