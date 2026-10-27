@@ -12,7 +12,23 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 
-_REGISTRY: dict[str, dict[str, str]] = {}
+class StageTracker(dict[str, str]):
+    """Keep each real stage assignment, including stages too fast for polling.
+
+    Tracks actual engine transitions; it never advances stages by elapsed time.
+    """
+
+    def __init__(self, initial_stage: str) -> None:
+        super().__init__(stage=initial_stage)
+        self.history: list[str] = [initial_stage]
+
+    def __setitem__(self, key: str, value: str) -> None:
+        super().__setitem__(key, value)
+        if key == "stage" and (not self.history or self.history[-1] != value):
+            self.history.append(value)
+
+
+_REGISTRY: dict[str, StageTracker] = {}
 _MAX_ENTRIES = 256
 # A finished entry stays readable this long so a late subscriber sees "done".
 _DONE_RETENTION_SECONDS = 30.0
@@ -24,7 +40,7 @@ _POLL_SECONDS = 0.25
 @contextmanager
 def tracked_progress(progress_id: str | None, stage: str) -> Iterator[dict[str, str]]:
     """Yield the stage dict for one operation, registered when an id is given."""
-    progress = {"stage": stage}
+    progress = StageTracker(stage)
     if progress_id:
         while len(_REGISTRY) >= _MAX_ENTRIES:
             _REGISTRY.pop(next(iter(_REGISTRY)))
@@ -40,6 +56,12 @@ def tracked_progress(progress_id: str | None, stage: str) -> Iterator[dict[str, 
                 )
             except RuntimeError:
                 _forget(progress_id, progress)
+
+
+def get_progress_history(progress_id: str) -> list[str] | None:
+    """Read the actual step transitions registered for an in-flight operation."""
+    entry = _REGISTRY.get(progress_id)
+    return list(entry.history) if entry is not None else None
 
 
 def _forget(progress_id: str, progress: dict[str, str]) -> None:

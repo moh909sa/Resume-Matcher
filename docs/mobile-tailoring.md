@@ -87,3 +87,56 @@ The Supabase `user_tailored_cvs` table has RLS; only the backend writes.
 **Before enabling production billing:** introduce subscription/usage limits,
 proper idempotent reservations and async jobs for long-running generations. The
 current preview request is synchronous and can take up to the server timeout.
+
+## Real-time iOS progress — owner-scoped polling (October 27, 2026)
+
+The **existing POST** `/api/v1/mobile/tailor/preview` remains synchronous, so
+existing mobile clients continue to function. New clients may send an optional
+fresh, random UUID v4 `progress_id` in the same JSON body with `resume_id`
+and `job_description`. This is for status monitoring only, not authorization.
+
+When the customer taps **Tailor My CV**:
+
+1. Generate a fresh UUID v4 before the POST. Start POST /tailor/preview with
+   `{"resume_id":"...","job_description":"...","progress_id":"<uuid>"}`.
+   Keep that POST alive and pending until it returns the actual preview.
+2. While the POST is running, GET
+   `/api/v1/mobile/tailor/progress/<uuid>` every **1.5–2 seconds** using the
+   *same* `Authorization: Bearer <Supabase access token>` header. The GET
+   starts working once the POST registers the run. A short initial 404 is
+   permitted; retry briefly. Different users cannot read a run.
+3. The response is light: `{progress_id,status,current_step,completed_steps,
+   visited_steps,tailoring_id,started_at,updated_at}`. The status is
+   `running`, `succeeded`, or `failed`.
+4. UI labels for the seven progress steps (in order):
+   - `read_job`: Read the job
+   - `plan_skills`: Plan the skills to show
+   - `tailor_resume`: Tailor the resume
+   - `keywords_facts`: Work in keywords and check facts
+   - `critique_writing`: Critique the writing
+   - `rewrite_lines`: Rewrite weak lines
+   - `verify_review`: Verify and prepare the review
+5. Green checks **only** for `completed_steps` sent by the server. Animate
+   exactly `current_step` while `running`. Leave non-visited steps muted
+   (a stage can be legitimately skipped). Never invent stage completion,
+   percent, expected completion time, or an animated fake progress percentage.
+   The elapsed timer starts at zero and continues independently of status.
+6. On successful **POST /tailor/preview**, stop polling and automatically
+   `router.replace("/tailoring/review")`, preserving the returned preview
+   and all user inputs, just as before. Do NOT wait for polling's final packet:
+   the POST is authoritative for success and returns the actual review data.
+   On POST error stop polling and show a Retry option with inputs preserved.
+   If status GET temporarily fails, retain the spinner and timer instead of
+   reporting phantom progress.
+7. Existing preview defaults (Full Tailor / No Limit / All) and the current
+   review, iterative keywords, Confirm & Save workflow stay unchanged.
+
+**Implementation:** `services/progress.py` captures *every* engine stage
+transition (even fast ones). A lightweight mirror in the **same Railway process**
+persists only changed stage sequences to `user_tailoring_progress` in Supabase.
+This allows authenticated GET polling from any Railway replica. Only the
+trusted server may write to that table; owner RLS permits reading. No CV text,
+job description, API secrets or prompt logs are written there. No new LLM calls
+are made for progress updates. This is not a durable background job; the
+existing POST must complete for its resume preview to be delivered.
+

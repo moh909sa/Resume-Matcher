@@ -206,6 +206,64 @@ class SupabaseBackend:
             },
         )
 
+    async def create_mobile_progress(
+        self, user_id: str, progress_id: str, resume_id: str
+    ) -> None:
+        """Create an owner-scoped progress row before the long AI operation."""
+        response = await self._request(
+            "POST", "/rest/v1/user_tailoring_progress",
+            headers={"Prefer": "return=representation"},
+            json={
+                "id": str(UUID(progress_id)),
+                "user_id": str(UUID(user_id)),
+                "source_resume_id": str(UUID(resume_id)),
+                "status": "running",
+                "stage": "starting",
+            },
+        )
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise SupabaseUnavailable("Unable to initialize mobile progress")
+
+    async def get_mobile_progress(
+        self, user_id: str, progress_id: str
+    ) -> dict[str, Any] | None:
+        """No user can read progress for another user, even knowing its UUID."""
+        response = await self._request(
+            "GET", "/rest/v1/user_tailoring_progress",
+            params={
+                "user_id": f"eq.{UUID(user_id)}",
+                "id": f"eq.{UUID(progress_id)}",
+                "select": (
+                    "id,user_id,status,stage,current_step,completed_steps,"
+                    "visited_steps,tailoring_id,created_at,updated_at,finished_at"
+                ),
+            },
+        )
+        rows = self._json(response)
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise SupabaseUnavailable("Invalid mobile progress response")
+        if not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, dict) or row.get("user_id") != user_id or row.get("id") != progress_id:
+            raise SupabaseUnavailable("Invalid mobile progress owner")
+        return row
+
+    async def update_mobile_progress(
+        self, user_id: str, progress_id: str, update: dict[str, Any]
+    ) -> None:
+        """Monotonic final status: background stage writes cannot undo completion."""
+        await self._request(
+            "PATCH", "/rest/v1/user_tailoring_progress",
+            params={
+                "user_id": f"eq.{UUID(user_id)}",
+                "id": f"eq.{UUID(progress_id)}",
+                "status": "eq.running",
+            },
+            json={**update, "updated_at": datetime.now(timezone.utc).isoformat()},
+        )
+
     async def create_tailored_record(self, values: dict[str, Any]) -> dict[str, Any]:
         response = await self._request(
             "POST", "/rest/v1/user_tailored_cvs",

@@ -1,8 +1,11 @@
 """Authenticated mobile CV tailoring: user-owned preview, explicit approval, and library."""
 
+import asyncio
+import logging
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -23,7 +26,13 @@ from app.schemas.models import (
 )
 from app.schemas.models import ResumeData
 from app.schemas.writing import ApplyKeywordsRequest, ForcedKeyword
-from app.services.supabase_backend import SupabaseBackend
+from app.services.mobile_progress import (
+    finished_progress_update,
+    mirror_engine_stages,
+)
+from app.services.supabase_backend import SupabaseBackend, SupabaseUnavailable
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/mobile", tags=["mobile-tailoring"], route_class=AIOperationRoute)
 
@@ -33,6 +42,7 @@ class MobileTailorRequest(BaseModel):
 
     resume_id: UUID
     job_description: str = Field(min_length=50, max_length=12000)
+    progress_id: UUID | None = None  # Client supplies a fresh UUID for live polling.
     max_pages: Literal[2, 3] | None = None
     max_bullets_per_entry: Literal[3, 5] | None = None
 
@@ -127,13 +137,35 @@ async def _owned_tailoring(
     return record
 
 
+@router.get("/tailor/progress/{progress_id}")
+async def get_mobile_tailor_progress(
+    progress_id: UUID,
+    user_id: str = Depends(current_user),
+    backend: SupabaseBackend = Depends(supabase_backend),
+) -> dict[str, Any]:
+    """Owner-only, lightweight polling endpoint; never returns private CV content."""
+    row = await backend.get_mobile_progress(user_id, str(progress_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Progress not found")
+    return {
+        "progress_id": row["id"],
+        "status": row["status"],
+        "current_step": row.get("current_step"),
+        "completed_steps": row.get("completed_steps") or [],
+        "visited_steps": row.get("visited_steps") or [],
+        "tailoring_id": row.get("tailoring_id"),
+        "started_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
 @router.post("/tailor/preview", status_code=201)
 async def preview_mobile_tailor(
     body: MobileTailorRequest,
     user_id: str = Depends(current_user),
     backend: SupabaseBackend = Depends(supabase_backend),
 ) -> dict[str, Any]:
-    """Generate a factual, unsaved preview using the existing full-tailoring engine."""
+    """Run full tailoring and report ACTUAL stages while POST is in flight."""
     source_id = str(body.resume_id)
     if await backend.get_record(user_id, source_id) is None:
         raise HTTPException(status_code=404, detail="Original CV not found")
@@ -143,16 +175,27 @@ async def preview_mobile_tailor(
         if source is None or source.get("processing_status") != "ready":
             raise HTTPException(status_code=409, detail="CV must be Ready before tailoring")
 
-        # All jobs are server-created under a verified source. No arbitrary job IDs
-        # from a mobile client are ever accepted by this endpoint.
-        jobs = await db.create_jobs([body.job_description], resume_id=source_id)
-        job_id = jobs[0]["job_id"]
+        progress_id = str(body.progress_id or uuid4())
+        # A progress UUID is unique to this run, and cannot be queried without
+        # the authenticated user's identity. Registration occurs BEFORE AI work.
+        await backend.create_mobile_progress(user_id, progress_id, source_id)
+        watcher = asyncio.create_task(
+            mirror_engine_stages(backend, user_id, progress_id),
+            name="mobile-tailoring-stage-mirror",
+        )
+        job_id: str | None = None
+        stored: dict[str, Any] | None = None
+        succeeded = False
         try:
+            # The mobile client never supplies arbitrary job IDs.
+            jobs = await db.create_jobs([body.job_description], resume_id=source_id)
+            job_id = jobs[0]["job_id"]
             preview = await improve_resume_preview_endpoint(
                 ImproveResumeRequest(
                     resume_id=source_id,
                     job_id=job_id,
                     prompt_id="full",
+                    progress_id=progress_id,
                     **_preview_length_options(body),
                 )
             )
@@ -177,15 +220,43 @@ async def preview_mobile_tailor(
                 "preview_expires_at": data.get("preview_expires_at"),
                 "preview_json": data,
             })
+            succeeded = True
         except Exception:
-            # Do not leave a job if its preview cannot be used by the mobile app.
-            await db.delete_job(job_id)
+            if job_id is not None:
+                await db.delete_job(job_id)
             raise
-    return {"tailoring_id": stored["id"], "status": "draft", "preview": data,
-            "review": _review_ui(data),
-            "preferences": {"max_pages": body.max_pages,
-                            "max_bullets_per_entry": body.max_bullets_per_entry,
-                            "tailoring_intensity": "full"}}
+        finally:
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher
+            try:
+                await backend.update_mobile_progress(
+                    user_id,
+                    progress_id,
+                    finished_progress_update(
+                        progress_id,
+                        succeeded=succeeded,
+                        tailoring_id=str(stored["id"]) if stored else None,
+                    ),
+                )
+            except SupabaseUnavailable:
+                # Do not discard an already-generated preview because of
+                # telemetry. The synchronous POST still determines navigation.
+                logger.warning("Unable to finalize mobile progress telemetry")
+
+    assert stored is not None
+    return {
+        "tailoring_id": stored["id"],
+        "progress_id": progress_id,
+        "status": "draft",
+        "preview": data,
+        "review": _review_ui(data),
+        "preferences": {
+            "max_pages": body.max_pages,
+            "max_bullets_per_entry": body.max_bullets_per_entry,
+            "tailoring_intensity": "full",
+        },
+    }
 
 
 @router.get("/tailor/{tailoring_id}/review")

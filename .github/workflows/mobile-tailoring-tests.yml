@@ -6,6 +6,9 @@ on:
     paths:
       - "apps/backend/app/routers/mobile_tailoring.py"
       - "apps/backend/app/services/supabase_backend.py"
+      - "apps/backend/app/services/progress.py"
+      - "apps/backend/app/services/mobile_progress.py"
+      - "apps/backend/tests/unit/test_mobile_real_progress.py"
       - "apps/backend/tests/unit/test_mobile_keyword_wizard.py"
       - "apps/backend/tests/unit/test_mobile_tailoring_contract.py"
       - "apps/backend/pyproject.toml"
@@ -28,9 +31,9 @@ jobs:
           cache-dependency-path: apps/backend/pyproject.toml
       - name: Compile mobile Python source
         run: |
-          python -m compileall -q apps/backend/app/routers/mobile_tailoring.py apps/backend/app/services/supabase_backend.py apps/backend/tests/unit/test_mobile_keyword_wizard.py
+          python -m compileall -q apps/backend/app/routers/mobile_tailoring.py apps/backend/app/services/supabase_backend.py apps/backend/app/services/progress.py apps/backend/app/services/mobile_progress.py apps/backend/tests/unit/test_mobile_real_progress.py
       - name: Install backend and test dependencies
         run: python -m pip install -e './apps/backend[dev]'
       - name: Run isolated mobile contract regression tests
         working-directory: apps/backend
-        run: python -m pytest -q tests/unit/test_mobile_tailoring_contract.py tests/unit/test_mobile_keyword_wizard.py
+        run: python -m pytest -q tests/unit/test_mobile_tailoring_contract.py tests/unit/test_mobile_keyword_wizard.py tests/unit/test_mobile_real_progress.py
