@@ -459,11 +459,14 @@ class SupabaseBackend:
             raise SupabaseUnavailable("Invalid tailored CV registry response")
         return rows[0]
 
-    async def list_tailored_records(self, user_id: str) -> list[dict[str, Any]]:
+    async def list_tailored_records(self, user_id: str, *, limit: int = 100, offset: int = 0, status: str | None = None) -> list[dict[str, Any]]:
+        params = {"user_id": f"eq.{UUID(user_id)}", "select": "*",
+                  "order": "created_at.desc,id.desc", "limit": str(limit), "offset": str(offset)}
+        if status is not None:
+            params["status"] = f"eq.{status}"
         response = await self._request(
             "GET", "/rest/v1/user_tailored_cvs",
-            params={"user_id": f"eq.{UUID(user_id)}", "select": "*",
-                    "order": "created_at.desc", "limit": "100"},
+            params=params,
         )
         rows = self._json(response)
         if not isinstance(rows, list) or any(

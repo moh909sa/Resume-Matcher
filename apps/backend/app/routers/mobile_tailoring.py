@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from app.ai_budget import AIOperationRoute
@@ -23,14 +23,19 @@ from app.schemas.models import (
     ImproveResumeConfirmRequest,
     ImproveResumeRequest,
     PageFitSettings,
+    ResumeData,
 )
-from app.schemas.models import ResumeData
 from app.schemas.writing import ApplyKeywordsRequest, ForcedKeyword
+from app.services.mobile_editor import EditorStore
 from app.services.mobile_progress import (
     finished_progress_update,
     mirror_engine_stages,
 )
-from app.services.supabase_backend import MobileJobConflict, SupabaseBackend, SupabaseUnavailable
+from app.services.supabase_backend import (
+    MobileJobConflict,
+    SupabaseBackend,
+    SupabaseUnavailable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +63,10 @@ class MobileTailorRequest(BaseModel):
 class MobileApplyKeywordsRequest(BaseModel):
     expected_preview_id: str = Field(min_length=1, max_length=100)
     keywords: list[ForcedKeyword] = Field(min_length=1, max_length=30)
+
+
+class MobileConfirmRequest(BaseModel):
+    expected_preview_id: str = Field(min_length=1, max_length=100)
 
 
 def _keyword_options(preview: dict[str, Any]) -> dict[str, Any]:
@@ -440,9 +449,12 @@ async def confirm_mobile_tailor(
     tailoring_id: UUID,
     user_id: str = Depends(current_user),
     backend: SupabaseBackend = Depends(supabase_backend),
+    body: MobileConfirmRequest | None = None,
 ) -> dict[str, Any]:
     """Approve exactly the saved server-generated preview, not client-authored facts."""
     record = await _owned_tailoring(backend, user_id, tailoring_id)
+    if body is not None and record.get("preview_id") != body.expected_preview_id:
+        raise HTTPException(status_code=409, detail="Preview changed. Review the latest CV before saving")
     if record["status"] == "ready":
         return {"tailoring_id": record["id"], "status": "ready",
                 "tailored_cv": record.get("result_json")}
@@ -497,8 +509,14 @@ async def confirm_mobile_tailor(
 async def list_mobile_tailored_cvs(
     user_id: str = Depends(current_user),
     backend: SupabaseBackend = Depends(supabase_backend),
+    limit: int = Query(100, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    status: Literal["ready", "draft"] | None = None,
 ) -> list[dict[str, Any]]:
-    return [_summary(row) for row in await backend.list_tailored_records(user_id)]
+    rows = await backend.list_tailored_records(user_id, limit=limit, offset=offset, status=status)
+    with resume_owner(user_id):
+        dates = await EditorStore(db).timestamps([row["engine_resume_id"] for row in rows if row.get("engine_resume_id") and row.get("status") == "ready"])
+    return [{**_summary(row), **({"updated_at": dates[row["engine_resume_id"]]} if row.get("engine_resume_id") in dates else {})} for row in rows]
 
 
 @router.get("/tailored-cvs/{tailoring_id}")

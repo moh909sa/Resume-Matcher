@@ -43,6 +43,9 @@ Free, open-source resume builder that tailors your resume (CV) to each job descr
 
 ## Getting Started
 
+This Railway fork also serves the authenticated iOS app. Its saved CV editing,
+Job Match and PDF export API is documented in [Mobile CV editor](docs/mobile-editor.md).
+
 Resume Matcher works by creating a master resume that you can use to tailor for each job application. Installation instructions here: [How to Install](#how-to-install)
 
 ### How It Works

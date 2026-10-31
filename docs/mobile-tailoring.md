@@ -72,12 +72,15 @@ Base path: `/api/v1/mobile`. Do not call legacy `/api/v1/jobs` or
    * User explicitly taps Confirm & Save. No automatic confirmation.
    * Handle temporary busy / retriable 409 states; never save an older preview.
 
-5. On approval: POST `/tailor/{tailoring_id}/confirm` with no JSON body.
-   The server atomically claims and confirms the latest stored draft and returns `status=ready` and
+5. On approval: POST `/tailor/{tailoring_id}/confirm` with
+   `{"expected_preview_id":"<reviewed preview ID>"}`. A mismatched preview returns 409 before saving.
+   Legacy bodyless requests remain supported. The server atomically claims and confirms the latest stored draft and returns `status=ready` and
    `tailored_cv`. Retry after transient failures; confirmation is replay-safe.
 6. GET `/tailored-cvs` lists owned saved/draft CVs (without large content).
    GET `/tailored-cvs/{tailoring_id}` returns the owned preview/result.
    The original CV is not overwritten. Concurrent keyword/confirm requests are serialized with a crash-recoverable 15-minute database lease.
+7. Open `/tailored-cvs/{tailoring_id}/editor` immediately after confirmed success.
+   Saved content, revision-safe edits, Job Match and PDF contracts are in [mobile-editor.md](mobile-editor.md).
 
 For preview errors, no fake output is stored. Jobs linked to unusable previews
 are cleaned up. Expired previews require generating a new one. Both authentication

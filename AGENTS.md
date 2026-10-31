@@ -12,4 +12,9 @@ Job descriptions the user saves for you go in [`jobs/`](jobs/README.md). That fo
 
 ## Changing Resume Matcher's code
 
+The authenticated mobile CV editor uses the canonical owner-scoped engine Resume,
+with additive immutable snapshots and mutation receipts in `mobile_editor_revisions`.
+See [docs/mobile-editor.md](docs/mobile-editor.md) for revision-safe saves, job-match
+freshness and authenticated snapshot PDF export. Uploaded originals remain unchanged.
+
 If the user wants to **change** Resume Matcher itself, follow [`.claude/CLAUDE.md`](.claude/CLAUDE.md) and [CONTRIBUTING.md](.github/CONTRIBUTING.md). Setup for development is in [SETUP.md](SETUP.md).

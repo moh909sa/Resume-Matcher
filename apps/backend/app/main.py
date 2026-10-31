@@ -37,8 +37,9 @@ from app.routers import (
     resumes_router,
     writing_router,
 )
-from app.routers.resumes import drain_processing_cleanup_tasks
+from app.routers.mobile_editor import router as mobile_editor_router
 from app.routers.mobile_tailoring import router as mobile_tailoring_router
+from app.routers.resumes import drain_processing_cleanup_tasks
 from app.services.supabase_backend import ResumeQuotaExceeded, SupabaseUnavailable
 
 
@@ -165,6 +166,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "X-Resume-Revision", "X-PDF-Page-Count"],
 )
 # Added last so it runs first: reject requests for hosts this app does not serve.
 app.add_middleware(HostGuardMiddleware, allowed_hosts=settings.effective_allowed_hosts)
@@ -173,6 +175,7 @@ app.add_middleware(HostGuardMiddleware, allowed_hosts=settings.effective_allowed
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(mobile_router, prefix="/api/v1")
 app.include_router(mobile_tailoring_router, prefix="/api/v1")
+app.include_router(mobile_editor_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
 app.include_router(resumes_router, prefix="/api/v1")
 app.include_router(jobs_router, prefix="/api/v1")

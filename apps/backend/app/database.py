@@ -39,6 +39,7 @@ from app.models import (
     Application,
     Improvement,
     Job,
+    MobileEditorRevision,
     QueueItem,
     Resume,
     TailoringPreview,
@@ -698,6 +699,10 @@ class Database:
                 delete(TailoringPreview).where(TailoringPreview.source_id == resume_id)
             )
             was_default = row.is_default_master
+            await session.execute(delete(MobileEditorRevision).where(
+                MobileEditorRevision.resume_id == resume_id,
+                MobileEditorRevision.owner_id == current_resume_owner(),
+            ))
             await session.delete(row)
             if was_default:
                 await session.flush()
@@ -1594,6 +1599,7 @@ class Database:
         async with queue_manager.paused():
             async with self._write_session() as session:
                 await session.execute(delete(QueueItem))
+                await session.execute(delete(MobileEditorRevision).where(MobileEditorRevision.owner_id == current_resume_owner()))
                 await session.execute(delete(TailoringPreview))
                 await session.execute(delete(Application))
                 await session.execute(delete(Improvement))
